@@ -1,0 +1,193 @@
+stages:
+  - test
+  - sonarqube
+  - build
+  - push
+  - deploy
+
+variables:
+  REGISTRY: registry.gitlab.com
+  IMAGE_PREFIX: $REGISTRY/$CI_PROJECT_PATH
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+
+# ─── Test Stage ───────────────────────────────────────────────────────────────
+
+.test_template: &test_template
+  stage: test
+  image: node:18-alpine
+  cache:
+    key: ${CI_JOB_NAME}-${CI_COMMIT_REF_SLUG}
+    paths:
+      - node_modules/
+  artifacts:
+    when: always
+    reports:
+      junit: test-results/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage/cobertura-coverage.xml
+    paths:
+      - coverage/
+      - test-results/
+
+test:user-service:
+  <<: *test_template
+  script:
+    - cd backend/user-service
+    - npm ci
+    - npm run test:ci
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+
+test:category-service:
+  <<: *test_template
+  script:
+    - cd backend/category-service
+    - npm ci
+    - npm run test:ci
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+
+test:product-service:
+  <<: *test_template
+  script:
+    - cd backend/product-service
+    - npm ci
+    - npm run test:ci
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+
+test:gateway-service:
+  <<: *test_template
+  script:
+    - cd backend/gateway-service
+    - npm ci
+    - npm run test:ci
+  coverage: '/All files[^|]*\|[^|]*\s+([\d\.]+)/'
+
+# ─── SonarQube Stage ──────────────────────────────────────────────────────────
+
+sonarqube:
+  stage: sonarqube
+  image:
+    name: sonarsource/sonar-scanner-cli:latest
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+    - sonar-scanner
+        -Dsonar.host.url=$SONAR_HOST_URL
+        -Dsonar.login=$SONAR_TOKEN
+        -Dsonar.qualitygate.wait=true
+  allow_failure: true
+  only:
+    - main
+    - develop
+
+# ─── Build Stage ──────────────────────────────────────────────────────────────
+
+.build_template: &build_template
+  stage: build
+  image: docker:24.0
+  services:
+    - docker:24.0-dind
+  before_script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $REGISTRY
+
+.build_service: &build_service
+  <<: *build_template
+  script:
+    - docker build -t $IMAGE_PREFIX/$SERVICE_NAME:$CI_COMMIT_SHA -t $IMAGE_PREFIX/$SERVICE_NAME:latest $BUILD_CONTEXT
+    - docker push $IMAGE_PREFIX/$SERVICE_NAME:$CI_COMMIT_SHA
+    - docker push $IMAGE_PREFIX/$SERVICE_NAME:latest
+
+build:user-service:
+  <<: *build_service
+  variables:
+    SERVICE_NAME: user-service
+    BUILD_CONTEXT: backend/user-service
+
+build:category-service:
+  <<: *build_service
+  variables:
+    SERVICE_NAME: category-service
+    BUILD_CONTEXT: backend/category-service
+
+build:product-service:
+  <<: *build_service
+  variables:
+    SERVICE_NAME: product-service
+    BUILD_CONTEXT: backend/product-service
+
+build:gateway-service:
+  <<: *build_service
+  variables:
+    SERVICE_NAME: gateway-service
+    BUILD_CONTEXT: backend/gateway-service
+
+build:frontend:
+  <<: *build_template
+  script:
+    - docker build
+        --build-arg REACT_APP_GATEWAY_URL=$REACT_APP_GATEWAY_URL
+        -t $IMAGE_PREFIX/frontend:$CI_COMMIT_SHA
+        -t $IMAGE_PREFIX/frontend:latest
+        frontend/
+    - docker push $IMAGE_PREFIX/frontend:$CI_COMMIT_SHA
+    - docker push $IMAGE_PREFIX/frontend:latest
+
+# ─── Deploy Stage ─────────────────────────────────────────────────────────────
+
+deploy:staging:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  environment:
+    name: staging
+    url: http://mern-app.staging.example.com
+  before_script:
+    - echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+  script:
+    - kubectl apply -f kubernetes/namespace.yaml
+    - kubectl apply -f kubernetes/mongodb.yaml
+    - kubectl apply -f kubernetes/user-service.yaml
+    - kubectl apply -f kubernetes/category-service.yaml
+    - kubectl apply -f kubernetes/product-service.yaml
+    - kubectl apply -f kubernetes/gateway-service.yaml
+    - kubectl apply -f kubernetes/frontend.yaml
+    - kubectl apply -f kubernetes/monitoring/
+    - |
+      for service in user-service category-service product-service gateway-service frontend; do
+        kubectl set image deployment/$service $service=$IMAGE_PREFIX/$service:$CI_COMMIT_SHA -n mern-app
+      done
+    - kubectl rollout status deployment/gateway-service -n mern-app --timeout=120s
+  only:
+    - develop
+
+deploy:production:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  environment:
+    name: production
+    url: http://mern-app.example.com
+  before_script:
+    - echo "$KUBE_CONFIG_PROD" | base64 -d > ~/.kube/config
+  script:
+    - kubectl apply -f kubernetes/namespace.yaml
+    - kubectl apply -f kubernetes/mongodb.yaml
+    - kubectl apply -f kubernetes/user-service.yaml
+    - kubectl apply -f kubernetes/category-service.yaml
+    - kubectl apply -f kubernetes/product-service.yaml
+    - kubectl apply -f kubernetes/gateway-service.yaml
+    - kubectl apply -f kubernetes/frontend.yaml
+    - kubectl apply -f kubernetes/monitoring/
+    - |
+      for service in user-service category-service product-service gateway-service frontend; do
+        kubectl set image deployment/$service $service=$IMAGE_PREFIX/$service:$CI_COMMIT_SHA -n mern-app
+      done
+    - kubectl rollout status deployment/gateway-service -n mern-app --timeout=120s
+  when: manual
+  only:
+    - main
